@@ -8,6 +8,7 @@
 using namespace gtfs;
 const std::string test_feed = "data/sample_feed";
 const std::string test_output_feed = "data/output_feed";
+// const std::string test_feed_ovapi = "data/gtfs-nl";
 
 TEST_SUITE_BEGIN("Handling time GTFS fields");
 TEST_CASE("Time in H:MM:SS format")
@@ -142,7 +143,8 @@ TEST_SUITE_END();
 TEST_SUITE_BEGIN("Csv parsing");
 TEST_CASE("Record with empty values")
 {
-  const auto res = CsvParser::split_record(",, ,");
+  CsvParser p;
+  const auto res = p.split_record(",, ,");
   REQUIRE_EQ(res.size(), 4);
   for (const auto & token : res)
     CHECK(token.empty());
@@ -150,7 +152,8 @@ TEST_CASE("Record with empty values")
 
 TEST_CASE("Header with UTF BOM")
 {
-  const auto res = CsvParser::split_record("\xef\xbb\xbfroute_id, agency_id", true);
+  CsvParser p;
+  const auto res = p.split_record("\xef\xbb\xbfroute_id, agency_id", true);
   REQUIRE_EQ(res.size(), 2);
   CHECK_EQ(res[0], "route_id");
   CHECK_EQ(res[1], "agency_id");
@@ -158,7 +161,8 @@ TEST_CASE("Header with UTF BOM")
 
 TEST_CASE("Quotation marks")
 {
-  const auto res = CsvParser::split_record(R"(27681 ,,"Sisters, OR",,"44.29124",1)");
+  CsvParser p;
+  const auto res = p.split_record(R"(27681 ,,"Sisters, OR",,"44.29124",1)");
   REQUIRE_EQ(res.size(), 6);
   CHECK_EQ(res[2], "Sisters, OR");
   CHECK_EQ(res[4], "44.29124");
@@ -167,7 +171,8 @@ TEST_CASE("Quotation marks")
 
 TEST_CASE("Not wrapped quotation marks")
 {
-  const auto res = CsvParser::split_record(R"(Contains "quotes", commas and text)");
+  CsvParser p;
+  const auto res = p.split_record(R"(Contains "quotes", commas and text)");
   REQUIRE_EQ(res.size(), 2);
   CHECK_EQ(res[0], R"(Contains "quotes")");
   CHECK_EQ(res[1], "commas and text");
@@ -175,27 +180,31 @@ TEST_CASE("Not wrapped quotation marks")
 
 TEST_CASE("Wrapped quotation marks")
 {
-  const auto res = CsvParser::split_record(R"("Contains ""quotes"", commas and text")");
+  CsvParser p;
+  const auto res = p.split_record(R"("Contains ""quotes"", commas and text")");
   REQUIRE_EQ(res.size(), 1);
   CHECK_EQ(res[0], R"(Contains "quotes", commas and text)");
 }
 
 TEST_CASE("Double wrapped quotation marks")
 {
-  const auto res = CsvParser::split_record(R"(""Double quoted text"")");
+  CsvParser p;
+  const auto res = p.split_record(R"(""Double quoted text"")");
   REQUIRE_EQ(res.size(), 1);
 }
 
 TEST_CASE("Read quoted empty values")
 {
-  const auto res = CsvParser::split_record(",\"\"");
+  CsvParser p;
+  const auto res = p.split_record(",\"\"");
   REQUIRE_EQ(res.size(), 2);
   CHECK_EQ(res[0], "");
   CHECK_EQ(res[1], "");
 }
 TEST_CASE("Read quoted quote")
 {
-  const auto res = CsvParser::split_record(",\"\"\"\"");
+  CsvParser p;
+  const auto res = p.split_record(",\"\"\"\"");
   REQUIRE_EQ(res.size(), 2);
   CHECK_EQ(res[0], "");
   CHECK_EQ(res[1], "\"");
@@ -203,7 +212,8 @@ TEST_CASE("Read quoted quote")
 
 TEST_CASE("Read quoted double quote")
 {
-  const auto res = CsvParser::split_record(",\"\"\"\"\"\"");
+  CsvParser p;
+  const auto res = p.split_record(",\"\"\"\"\"\"");
   REQUIRE_EQ(res.size(), 2);
   CHECK_EQ(res[0], "");
   CHECK_EQ(res[1], "\"\"");
@@ -211,7 +221,8 @@ TEST_CASE("Read quoted double quote")
 
 TEST_CASE("Read quoted values with quotes in begin")
 {
-  const auto res = CsvParser::split_record(",\"\"\"Name\"\" and some other\"");
+  CsvParser p;
+  const auto res = p.split_record(",\"\"\"Name\"\" and some other\"");
   REQUIRE_EQ(res.size(), 2);
   CHECK_EQ(res[0], "");
   CHECK_EQ(res[1], "\"Name\" and some other");
@@ -219,7 +230,8 @@ TEST_CASE("Read quoted values with quotes in begin")
 
 TEST_CASE("Read quoted values with quotes at end")
 {
-  const auto res = CsvParser::split_record(",\"Text and \"\"Name\"\"\"");
+  CsvParser p;
+  const auto res = p.split_record(",\"Text and \"\"Name\"\"\"");
   REQUIRE_EQ(res.size(), 2);
   CHECK_EQ(res[0], "");
   CHECK_EQ(res[1], "Text and \"Name\"");
@@ -233,7 +245,7 @@ TEST_CASE("Empty container before parsing")
 {
   Feed feed("data/non_existing_dir");
   REQUIRE(feed.get_agencies().empty());
-  auto agency = feed.get_agency("agency_10");
+  auto agency = feed.get_agency(feed.get_id("agency_10"));
   const Agency non_existing_agency;
   CHECK_EQ(agency, non_existing_agency);
 }
@@ -257,7 +269,7 @@ TEST_CASE("Transfers")
   CHECK_EQ(transfers[0].transfer_type, TransferType::MinimumTime);
   CHECK_EQ(transfers[0].min_transfer_time, 70);
 
-  const auto & transfer = feed.get_transfer("314", "11");
+  const auto & transfer = feed.get_transfer(feed.get_id("314"), feed.get_id("11"));
 
   CHECK_EQ(transfer.transfer_type, TransferType::Timed);
   CHECK_EQ(transfer.min_transfer_time, 0);
@@ -270,7 +282,7 @@ TEST_CASE("Calendar")
   const auto & calendar = feed.get_calendar();
   REQUIRE_EQ(calendar.size(), 2);
 
-  const auto & calendar_record = feed.get_calendar_item("WE");
+  const auto & calendar_record = feed.get_calendar_item(feed.get_id("WE"));
 
   CHECK_EQ(calendar_record.start_date, Date(2007, 01, 01));
   CHECK_EQ(calendar_record.end_date, Date(2010, 12, 31));
@@ -291,7 +303,7 @@ TEST_CASE("Calendar dates")
   const auto & calendar_dates = feed.get_calendar_dates();
   REQUIRE_EQ(calendar_dates.size(), 1);
 
-  const auto & calendar_records_range = feed.get_calendar_dates("FULLW");
+  const auto & calendar_records_range = feed.get_calendar_dates(feed.get_id("FULLW"));
 
   CHECK_EQ(calendar_records_range.first->date, Date(2007, 06, 04));
   CHECK_EQ(calendar_records_range.first->exception_type, CalendarDateException::Removed);
@@ -321,6 +333,43 @@ TEST_CASE("Read GTFS feed")
   CHECK_EQ(feed.get_translations().size(), 1);
 }
 
+bool strcmp_interned(const InternedString& a, const InternedString& b) {
+  return a.length == b.length && strncmp(a.value ? a.value : "", b.value ? b.value : "", a.length) == 0;
+}
+
+void compare_agencies_across_feeds(const Agencies& agencies, const Agencies& other) {
+  CHECK_EQ(agencies.size(), other.size());
+  if (agencies.size() == other.size()) {
+    for (size_t i = 0; i < agencies.size(); ++i) {
+        CHECK(strcmp_interned(agencies[i].agency_id, other[i].agency_id));
+        CHECK(strcmp_interned(agencies[i].agency_name, other[i].agency_name));
+        CHECK(strcmp_interned(agencies[i].agency_url, other[i].agency_url));
+        CHECK(strcmp_interned(agencies[i].agency_timezone, other[i].agency_timezone));
+
+        CHECK(strcmp_interned(agencies[i].agency_lang, other[i].agency_lang));
+        CHECK(strcmp_interned(agencies[i].agency_phone, other[i].agency_phone));
+
+        CHECK(strcmp_interned(agencies[i].agency_fare_url, other[i].agency_fare_url));
+        CHECK(strcmp_interned(agencies[i].agency_email, other[i].agency_email));
+    }
+  }
+}
+
+void compare_fare_atrributes_across_feeds(const FareAttributes& fare_attributes, const FareAttributes& other) {
+  CHECK_EQ(fare_attributes.size(), other.size());
+  if (fare_attributes.size() == other.size()) {
+    for (size_t i = 0; i < fare_attributes.size(); ++i) {
+        CHECK(strcmp_interned(fare_attributes[i].fare_id, other[i].fare_id));
+        CHECK_EQ(fare_attributes[i].price, other[i].price);
+        CHECK_EQ(fare_attributes[i].currency_type, other[i].currency_type);
+        CHECK_EQ(fare_attributes[i].payment_method, other[i].payment_method);
+        CHECK_EQ(fare_attributes[i].transfers, other[i].transfers);
+        CHECK(strcmp_interned(fare_attributes[i].agency_id, other[i].agency_id));
+        CHECK_EQ(fare_attributes[i].transfer_duration, other[i].transfer_duration);
+    }
+  }
+}
+
 TEST_CASE("Agency")
 {
   Feed feed(test_feed);
@@ -334,13 +383,14 @@ TEST_CASE("Agency")
   CHECK(agencies[0].agency_lang.empty());
   CHECK_EQ(agencies[0].agency_timezone, "America/Los_Angeles");
 
-  const auto agency = feed.get_agency("DTA");
+  const auto agency = feed.get_agency(feed.get_id("DTA"));
   CHECK_EQ(agency.agency_name, "Demo Transit Authority");
 
   REQUIRE_EQ(feed.write_agencies(test_output_feed), ResultCode::OK);
   Feed feed_copy(test_output_feed);
   REQUIRE_EQ(feed_copy.read_feed(false), ResultCode::OK);
-  CHECK_EQ(agencies, feed_copy.get_agencies());
+  
+  compare_agencies_across_feeds(agencies, feed_copy.get_agencies());
 }
 
 TEST_CASE("Routes")
@@ -360,7 +410,7 @@ TEST_CASE("Routes")
   CHECK(routes[i].route_color.empty());
   CHECK(routes[i].route_desc.empty());
 
-  const auto & route = feed.get_route("AB");
+  const auto & route = feed.get_route(feed.get_id("AB"));
   CHECK_EQ(route.agency_id, "DTA");
   CHECK_EQ(route.route_type, RouteType::Bus);
 }
@@ -382,7 +432,7 @@ TEST_CASE("Trips")
   CHECK_EQ(trips[i].service_id, "FULLW");
   CHECK_EQ(trips[i].trip_id, "AB1");
 
-  const auto & trip = feed.get_trip("AB1");
+  const auto & trip = feed.get_trip(feed.get_id("AB1"));
   CHECK(trip.trip_short_name.empty());
 }
 
@@ -404,7 +454,7 @@ TEST_CASE("Stops")
   CHECK_EQ(stops[i].location_type, StopLocationType::StopOrPlatform);
   CHECK(stops[i].zone_id.empty());
 
-  auto const & stop = feed.get_stop("FUR_CREEK_RES");
+  auto const & stop = feed.get_stop(feed.get_id("FUR_CREEK_RES"));
   CHECK_EQ(stop.stop_name, "Furnace Creek Resort (Demo)");
 }
 
@@ -426,10 +476,10 @@ TEST_CASE("StopTimes")
   CHECK_EQ(stop_times[i].pickup_type, StopTimeBoarding::RegularlyScheduled);
   CHECK_EQ(stop_times[i].drop_off_type, StopTimeBoarding::RegularlyScheduled);
 
-  CHECK_EQ(feed.get_stop_times_for_stop("STAGECOACH").size(), 3);
+  CHECK_EQ(feed.get_stop_times_for_stop(feed.get_id("STAGECOACH")).size(), 3);
 
-  CHECK_EQ(std::distance(feed.get_stop_times_for_trip("STBA").first,
-                         feed.get_stop_times_for_trip("STBA").second),
+  CHECK_EQ(std::distance(feed.get_stop_times_for_trip(feed.get_id("STBA")).first,
+                         feed.get_stop_times_for_trip(feed.get_id("STBA")).second),
            2);
 }
 
@@ -441,12 +491,12 @@ TEST_CASE("Shapes")
   const auto & shapes = feed.get_shapes();
   REQUIRE_EQ(shapes.size(), 8);
   CHECK_EQ(shapes[0].shape_id, "10237");
-  CHECK_EQ(shapes[0].shape_pt_lat, 43.5176524709);
-  CHECK_EQ(shapes[0].shape_pt_lon, -79.6906570431);
+  CHECK(abs(shapes[0].shape_pt_lat - 43.5176524709) < 1e-9);
+  CHECK(abs(shapes[0].shape_pt_lon - -79.6906570431) < 1e-9);
   CHECK_EQ(shapes[0].shape_pt_sequence, 50017);
   CHECK_EQ(shapes[0].shape_dist_traveled, 12669);
 
-  const auto & shape = feed.get_shape("10237");
+  const auto & shape = feed.get_shape(feed.get_id("10237"));
   CHECK_EQ(std::distance(shape.first, shape.second), 4);
 }
 
@@ -463,7 +513,7 @@ TEST_CASE("Calendar")
   CHECK_EQ(calendar[0].monday, CalendarAvailability::Available);
   CHECK_EQ(calendar[0].sunday, CalendarAvailability::Available);
 
-  const auto & calendar_for_service = feed.get_calendar_dates("FULLW");
+  const auto & calendar_for_service = feed.get_calendar_dates(feed.get_id("FULLW"));
   CHECK_EQ(std::distance(calendar_for_service.first, calendar_for_service.second), 1);
 }
 
@@ -478,7 +528,7 @@ TEST_CASE("Calendar dates")
   CHECK_EQ(calendar_dates[0].date, Date(2007, 06, 04));
   CHECK_EQ(calendar_dates[0].exception_type, CalendarDateException::Removed);
 
-  const auto & d = feed.get_calendar_dates("FULLW");
+  const auto & d = feed.get_calendar_dates(feed.get_id("FULLW"));
   CHECK_EQ(std::distance(d.first, d.second), 1);
 }
 
@@ -495,7 +545,7 @@ TEST_CASE("Frequencies")
   CHECK_EQ(frequencies[i].end_time, Time(22, 00, 00));
   CHECK_EQ(frequencies[i].headway_secs, 1800);
 
-  const auto & f = feed.get_frequencies("CITY1");
+  const auto & f = feed.get_frequencies(feed.get_id("CITY1"));
   CHECK_EQ(std::distance(f.first, f.second), 5);
 }
 
@@ -528,14 +578,14 @@ TEST_CASE("Fare attributes")
   CHECK_EQ(attributes[2].transfers, FareTransfers::Unlimited);
   CHECK_EQ(attributes[2].transfer_duration, 60);
 
-  const auto & attributes_for_id = feed.get_fare_attributes("a");
+  const auto & attributes_for_id = feed.get_fare_attributes(feed.get_id("a"));
   REQUIRE_EQ(std::distance(attributes_for_id.first, attributes_for_id.second), 1);
   CHECK_EQ(attributes_for_id.first->price, 5.25);
 
   REQUIRE_EQ(feed.write_fare_attributes(test_output_feed), ResultCode::OK);
   Feed feed_copy(test_output_feed);
   REQUIRE_EQ(feed_copy.read_feed(false), ResultCode::OK);
-  CHECK_EQ(attributes, feed_copy.get_fare_attributes());
+  compare_fare_atrributes_across_feeds(attributes, feed_copy.get_fare_attributes());
 }
 
 TEST_CASE("Fare rules")
@@ -548,7 +598,7 @@ TEST_CASE("Fare rules")
   CHECK_EQ(fare_rules[1].fare_id, "p");
   CHECK_EQ(fare_rules[1].route_id, "AB");
 
-  const auto & rules_for_id = feed.get_fare_rules("p");
+  const auto & rules_for_id = feed.get_fare_rules(feed.get_id("p"));
   CHECK_EQ(std::distance(rules_for_id.first, rules_for_id.second), 3);
 }
 
@@ -562,7 +612,7 @@ TEST_CASE("Levels")
   CHECK_EQ(levels[1].level_id, "U321L1");
   CHECK_EQ(levels[1].level_index, -1.5);
 
-  const auto & level = feed.get_level("U321L2");
+  const auto & level = feed.get_level(feed.get_id("U321L2"));
 
   CHECK_EQ(level.level_index, -2);
   CHECK_EQ(level.level_name, "Vestibul2");
@@ -583,7 +633,7 @@ TEST_CASE("Pathways")
   CHECK_EQ(pathways[0].reversed_signposted_as, "Sign2");
   CHECK_EQ(pathways[0].is_bidirectional, PathwayDirection::Bidirectional);
 
-  const auto & pathways_by_id = feed.get_pathways("T-A01D01");
+  const auto & pathways_by_id = feed.get_pathways(feed.get_id("T-A01D01"));
 
   CHECK_EQ(std::distance(pathways_by_id.first, pathways_by_id.second), 2);
   CHECK_EQ(pathways_by_id.first->is_bidirectional, PathwayDirection::Unidirectional);
@@ -605,7 +655,7 @@ TEST_CASE("Translations")
   CHECK(translations[0].record_sub_id.empty());
   CHECK(translations[0].field_value.empty());
 
-  auto const & t = feed.get_translations("stop_times");
+  auto const & t = feed.get_translations(feed.get_id("stop_times"));
   CHECK_EQ(std::distance(t.first, t.second), 1);
 }
 
@@ -644,44 +694,57 @@ TEST_SUITE_BEGIN("Simple pipelines");
 
 TEST_CASE("Agencies create & save")
 {
-  Feed feed_for_writing;
+  Feed feed;
 
   Agency agency1;
-  agency1.agency_id = "0Id_b^3 Company";
-  agency1.agency_name = R"(Big Big "Bus Company")";
-  agency1.agency_email = "b3c@gtfs.com";
-  agency1.agency_fare_url = "b3c.no";
+  agency1.agency_id = feed.get_id("0Id_b^3 Company");
+  agency1.agency_name = feed.get_text(R"(Big Big "Bus Company")");
+  agency1.agency_email = feed.get_text("b3c@gtfs.com");
+  agency1.agency_fare_url = feed.get_text("b3c.no");
 
   Agency agency2;
-  agency2.agency_id = "kwf";
-  agency2.agency_name = R"("killer whale ferries")";
-  agency2.agency_lang = "en";
-  agency2.agency_phone = "842";
-  agency2.agency_timezone = "Asia/Tokyo";
-  agency2.agency_fare_url = "f@mail.com";
+  agency2.agency_id = feed.get_id("kwf");
+  agency2.agency_name = feed.get_text(R"("killer whale ferries")");
+  agency2.agency_lang = feed.get_text("en");
+  agency2.agency_phone = feed.get_text("842");
+  agency2.agency_timezone = feed.get_text("Asia/Tokyo");
+  agency2.agency_fare_url = feed.get_text("f@mail.com");
+  
+  feed.add_agency(agency1);
+  feed.add_agency(agency2);
 
-  feed_for_writing.add_agency(agency1);
-  feed_for_writing.add_agency(agency2);
-
-  REQUIRE_EQ(feed_for_writing.write_agencies(test_output_feed), ResultCode::OK);
+  REQUIRE_EQ(feed.write_agencies(test_output_feed), ResultCode::OK);
   Feed feed_for_testing(test_output_feed);
 
   REQUIRE_EQ(feed_for_testing.read_feed(false), ResultCode::OK);
-  CHECK_EQ(feed_for_writing.get_agencies(), feed_for_testing.get_agencies());
+  compare_agencies_across_feeds(feed.get_agencies(), feed_for_testing.get_agencies());
 }
 
 TEST_CASE("Shapes create & save")
 {
-  Feed feed_for_writing;
+  Feed feed;
 
-  feed_for_writing.add_shape(ShapePoint{"id1", 61.197843, -149.867731, 0, 0});
-  feed_for_writing.add_shape(ShapePoint{"id1", 61.199419, -149.867680, 1, 178});
-  feed_for_writing.add_shape(ShapePoint{"id2", 61.199972, -149.867731, 2, 416});
+  feed.add_shape(ShapePoint{feed.get_id("id1"), 61.197843, -149.867731, 0, 0});
+  feed.add_shape(ShapePoint{feed.get_id("id1"), 61.199419, -149.867680, 1, 178});
+  feed.add_shape(ShapePoint{feed.get_id("id2"), 61.199972, -149.867731, 2, 416});
 
-  REQUIRE_EQ(feed_for_writing.write_shapes(test_output_feed), ResultCode::OK);
+  REQUIRE_EQ(feed.write_shapes(test_output_feed), ResultCode::OK);
   Feed feed_for_testing(test_output_feed);
 
   REQUIRE_EQ(feed_for_testing.read_feed(false), ResultCode::OK);
   CHECK_EQ(feed_for_testing.get_shapes().size(), 3);
 }
+
+/*TEST_CASE("OVapi")
+{
+    auto begin = std::chrono::high_resolution_clock::now();
+    Feed feed(test_feed_ovapi);
+    REQUIRE_EQ(feed.read_feed(), ResultCode::OK);
+
+    auto end = std::chrono::high_resolution_clock::now();
+    std::cout << "Time to read OVapi GTFS feed: "
+              << std::chrono::duration_cast<std::chrono::milliseconds>(end - begin).count()
+              << " ms" << std::endl;
+}*/
+
 TEST_SUITE_END();

@@ -16,10 +16,12 @@
 #include <string>
 #include <tuple>
 #include <type_traits>
-#include <unordered_map>
-#include <unordered_set>
 #include <utility>
 #include <vector>
+#include <charconv>
+#include <list>
+
+#include "parallel_hashmap/phmap.h"
 
 namespace gtfs
 {
@@ -44,6 +46,126 @@ inline const std::string file_attributions = "attributions.txt";
 
 inline constexpr char csv_separator = ',';
 inline constexpr char quote = '"';
+
+
+// String interner ------------------------------------------------------------------------------
+struct InternedString {
+    const char* value;
+    size_t length;
+
+    InternedString() : value(nullptr), length(0) {}
+
+    operator std::string_view() const { return value ? std::string_view(value, length) : std::string_view(""); }
+    
+    bool operator==(const InternedString& other) const { return value == other.value; }
+    bool operator!=(const InternedString& other) const { return !(*this == other); }
+
+    bool operator<(const InternedString& other) const { return strncmp(value ? value : "", other.value ? other.value : "", length) < 0; }
+    bool operator>(const InternedString& other) const { return strncmp(value ? value : "", other.value ? other.value : "", length) > 0; }
+
+    bool empty() const { return value == nullptr; } // We always intern empty strings as nullptr
+
+private:
+    explicit InternedString(const char* v, size_t len) : value(v), length(len) {}
+
+    friend class StringInterner;
+};
+
+inline bool operator==(const InternedString& lhs, const std::string_view& rhs) { return strncmp(lhs.value ? lhs.value : "", rhs.data(), lhs.length) == 0; }
+inline bool operator<(const InternedString& lhs, const std::string_view& rhs) { return strncmp(lhs.value ? lhs.value : "", rhs.data(), lhs.length) < 0; }
+inline bool operator>(const InternedString& lhs, const std::string_view& rhs) { return strncmp(lhs.value ? lhs.value : "", rhs.data(), lhs.length) > 0; }
+inline bool operator!=(const InternedString& lhs, const std::string_view& rhs) { return !(lhs == rhs); }
+
+inline int stoi(std::string_view sv) {
+  size_t i;
+  int ret = 0;
+  for(i = 0; i < sv.size(); ++i)
+  {
+    ret = ret * 10 + (sv[i] - '0');
+  }
+  return ret;
+}
+
+inline double stod(std::string_view sv) {
+  double d = 0.0;
+    double factor = 1.0;
+    bool negative = false;
+    if(!sv.empty() && sv[0] == '-') {
+      negative = true;
+      sv.remove_prefix(1);
+    }
+    bool decimal_found = false;
+    for(size_t i = 0; i < sv.size(); ++i)
+    {
+      if(sv[i] == '.')
+      {
+        decimal_found = true;
+        continue;
+      }
+      if(!decimal_found)
+      {
+        d = d * 10.0 + (sv[i] - '0');
+      }
+      else
+      {
+        factor *= 0.1;
+        d = d + (sv[i] - '0') * factor;
+      }
+    }
+    if(negative) {
+      d = -d;
+    }
+    return d;
+}
+
+class StringInterner {
+public:
+  StringInterner() = default;
+  StringInterner(const StringInterner&) = delete;
+  StringInterner& operator=(const StringInterner&) = delete;
+
+  InternedString intern(std::string_view sv) {
+    if (sv.empty()) {
+      return {};
+    }
+
+    auto it_owned = owned_strings_.find(sv);
+    if (it_owned != owned_strings_.end()) {
+      return InternedString(it_owned->c_str(), it_owned->size());
+    }
+
+    auto it_borrowed = borrowed_strings_.find(sv);
+    if (it_borrowed != borrowed_strings_.end()) {
+      return InternedString(it_borrowed->data(), it_borrowed->size());
+    }
+
+    auto [it_inserted, _] = owned_strings_.emplace(sv);
+    return InternedString(it_inserted->c_str(), it_inserted->size());
+  }
+
+  InternedString intern_dont_copy(std::string_view sv) {
+    if (sv.empty()) {
+      return {};
+    }
+
+    auto it_owned = owned_strings_.find(sv);
+    if (it_owned != owned_strings_.end()) {
+      return InternedString(it_owned->c_str(), it_owned->size());
+    }
+
+    auto it_borrowed = borrowed_strings_.find(sv);
+    if (it_borrowed != borrowed_strings_.end()) {
+      return InternedString(it_borrowed->data(), it_borrowed->size());
+    }
+
+    auto [it_inserted, _] = borrowed_strings_.emplace(sv);
+    return InternedString(it_inserted->data(), it_inserted->size());
+  }
+
+private:
+  phmap::node_hash_set<std::string> owned_strings_;
+  phmap::flat_hash_set<std::string_view> borrowed_strings_;
+};
 
 // Helper classes and functions---------------------------------------------------------------------
 struct InvalidFieldFormat : public std::exception
@@ -161,6 +283,16 @@ inline std::string wrap(const std::string & text)
     return text;
 
   return quote_text(text);
+}
+
+inline std::string wrap(const InternedString & text)
+{
+  return wrap(std::string(text));
+}
+
+inline std::string wrap(std::string_view text)
+{
+  return wrap(std::string(text));
 }
 
 // Save to csv enum value as unsigned integer.
@@ -313,139 +445,303 @@ inline void write_attributions_header(std::ofstream & out)
 }
 
 // Csv parser  -------------------------------------------------------------------------------------
+struct ParsedCsvRow {
+    ParsedCsvRow(const std::vector<std::string_view>& field_sequence)
+        : field_sequence(field_sequence), values(field_sequence.size()) {}
+
+    void clear() {
+        memset(values.data(), 0, values.size() * sizeof(std::string_view));
+    }
+
+    bool empty() const {
+        return std::all_of(values.begin(), values.end(), [](const std::string_view& v) { return v.empty(); });
+    }
+
+    auto find(std::string_view key) const {
+        auto it = std::find(field_sequence.begin(), field_sequence.end(), key);
+        if (it == field_sequence.end())
+            return values.end();
+
+        return values.begin() + std::distance(field_sequence.begin(), it);
+    }
+
+    auto end() const {
+        return values.end();
+    }
+
+    // Using InternedString here will need big refactor, but
+    // this in OVapi is ~20% of the runtime.
+    // So maybe it will be worth to do, but .. meh
+    std::string_view& operator[](std::string_view key) {
+        auto it = std::find(field_sequence.begin(), field_sequence.end(), key);
+        if (it == field_sequence.end())
+            throw std::out_of_range("Unknown column");
+
+        return values[std::distance(field_sequence.begin(), it)];
+    }
+
+    std::string_view at(std::string_view key) const { return const_cast<ParsedCsvRow*>(this)->operator[](key); }
+
+private:
+    const std::vector<std::string_view>& field_sequence;
+    std::vector<std::string_view> values;
+    static inline std::string_view dummy{};
+};
+
 class CsvParser
 {
 public:
   CsvParser() = default;
   inline explicit CsvParser(const std::string & gtfs_directory);
 
-  inline Result read_header(const std::string & csv_filename);
-  inline Result read_row(std::map<std::string, std::string> & obj);
+  inline Result read_header(const std::string & csv_filename, const std::function<void(size_t)> & reserve_space);
+  inline Result read_row(ParsedCsvRow & obj);
 
-  inline static std::vector<std::string> split_record(const std::string & record,
-                                                      bool is_header = false);
+  inline std::vector<std::string_view> split_record(std::string_view record,
+                                                    bool is_header = false);
+  inline void split_record(std::string_view record, bool is_header, std::vector<std::string_view> & fields);
 
 private:
-  std::vector<std::string> field_sequence;
+  std::string_view extract_field(
+      std::string_view record,
+      size_t offset,
+      size_t len,
+      bool had_quotes);
+
+  std::vector<std::string_view> field_sequence;
+  std::vector<std::string_view> field_values_per_row;
   std::string gtfs_path;
-  std::ifstream csv_stream;
+
+  phmap::flat_hash_map<std::string, std::string> csv_files_per_path;
+  std::string_view csv_cursor;
+
+  std::list<std::string> unquoted_fields;
+
+  friend class Feed;
 };
 
 inline CsvParser::CsvParser(const std::string & gtfs_directory) : gtfs_path(gtfs_directory) {}
 
-inline std::string trim_spaces(const std::string & token)
+inline std::string_view trim_spaces(const std::string_view & token)
 {
-  static const std::string delimiters = " \t";
-  std::string res = token;
-  res.erase(0, res.find_first_not_of(delimiters));
-  res.erase(res.find_last_not_of(delimiters) + 1);
-  return res;
+  std::string_view cursor = token;
+  while (cursor.size() && isblank(cursor.front()))
+    cursor.remove_prefix(1);
+  while (cursor.size() && isblank(cursor.back()))
+    cursor.remove_suffix(1);
+  return cursor;
 }
 
-inline std::string normalize(std::string & token, bool has_quotes)
+inline void CsvParser::split_record(std::string_view record, bool is_header, std::vector<std::string_view> & fields)
 {
-  std::string res = trim_spaces(token);
-  if (has_quotes)
-    return unquote_text(res);
-  return res;
-}
-
-inline std::vector<std::string> CsvParser::split_record(const std::string & record, bool is_header)
-{
-  size_t start_index = 0;
-  if (is_header)
-  {
-    // ignore UTF-8 BOM prefix:
-    if (record.size() > 2 && record[0] == '\xef' && record[1] == '\xbb' && record[2] == '\xbf')
-      start_index = 3;
-  }
-
-  std::vector<std::string> fields;
-  fields.reserve(20);
-
-  std::string token;
-  token.reserve(record.size());
-
-  bool is_inside_quotes = false;
-  bool quotes_in_token = false;
-
-  for (size_t i = start_index; i < record.size(); ++i)
-  {
-    if (record[i] == quote)
+    size_t start = 0;
+    if (is_header &&
+        record.size() > 2 &&
+        record[0] == '\xef' && record[1] == '\xbb' && record[2] == '\xbf')
     {
-      is_inside_quotes = !is_inside_quotes;
-      quotes_in_token = true;
-      token += record[i];
-      continue;
+        start = 3;
     }
 
-    if (record[i] == csv_separator)
-    {
-      if (is_inside_quotes)
-      {
-        token += record[i];
+    const size_t n = record.size();
+
+    bool inside = false;
+    bool has_escaped_quotes = false;
+
+    size_t field_start = start;
+
+    size_t field_index = 0;
+    for (size_t i = start; i < n; ++i) {
+        const char c = record[i];
+
+        if (c == quote) {
+            if (inside && i + 1 < n && record[i + 1] == quote) {
+                // Doubled quote inside quoted field
+                has_escaped_quotes = true;
+                ++i; // Skip the second quote
+                continue;
+            }
+            inside = !inside;
+            continue;
+        }
+
+        if (c == csv_separator && !inside) {
+            if (field_index >= fields.size()) {
+                fields.resize(field_index + 1);
+            }
+            fields[field_index++] = extract_field(record, field_start, i - field_start, has_escaped_quotes);
+            has_escaped_quotes = false;
+            field_start = i + 1;
+            continue;
+        }
+
+        // Skip \t, \r by adjusting field_start forward if needed
+        // No copying; just don't include them in the view.
+    }
+
+    if (field_index >= fields.size()) {
+        fields.resize(field_index + 1);
+    }
+    fields[field_index++] = extract_field(record, field_start, n - field_start, has_escaped_quotes);
+}
+
+inline std::vector<std::string_view>
+CsvParser::split_record(std::string_view record, bool is_header)
+{
+    std::vector<std::string_view> fields;
+    fields.reserve(20);
+    split_record(record, is_header, fields);
+    return fields;
+}
+
+std::string_view CsvParser::extract_field(
+    std::string_view record,
+    size_t offset,
+    size_t len,
+    bool has_escaped_quotes)
+{
+  // Fast path if we never saw any quote characters at all.
+  // Note: split_record currently sets had_quotes if any quote was encountered, even if
+  // they are just literal quotes inside an unquoted field. We only want to unescape
+  // when the field is fully quoted (starts and ends with a quote).
+  const std::string_view field_sv = record.substr(offset, len);
+  if (!has_escaped_quotes) {
+    // Check if it's a simple quoted field like "123"
+    if (field_sv.size() >= 2 && field_sv.front() == quote && field_sv.back() == quote) {
+      // Strip outer quotes, no unescaping needed
+      return trim_spaces(field_sv.substr(1, field_sv.size() - 2));
+    }
+    return trim_spaces(field_sv);
+  }
+
+  const bool fully_quoted = field_sv.size() >= 2 && field_sv.front() == quote && field_sv.back() == quote;
+  if (!fully_quoted) {
+    // Treat quotes as literals; do not attempt unescape.
+    return trim_spaces(field_sv);
+  }
+
+  // Slow path: unescape into owned storage (keep output stable after we discard original buffer)
+  std::string& out = unquoted_fields.emplace_back();
+  out.reserve(field_sv.size());
+
+  const char* p = field_sv.data();
+  const char* end = p + field_sv.size();
+
+  bool in_quotes = false;
+
+  while (p < end) {
+    char c = *p++;
+
+    if (c == quote) {
+      if (!in_quotes) {
+        in_quotes = true; // opening quote
         continue;
       }
 
-      fields.emplace_back(normalize(token, quotes_in_token));
-      token.clear();
-      quotes_in_token = false;
+      if (p < end && *p == quote) {
+        // doubled quote -> literal quote
+        out.push_back(quote);
+        ++p;
+        continue;
+      }
+
+      in_quotes = false; // closing quote
       continue;
     }
 
-    // Skip delimiters:
-    if (record[i] != '\t' && record[i] != '\r')
-      token += record[i];
+    out.push_back(c);
   }
 
-  fields.emplace_back(normalize(token, quotes_in_token));
-  return fields;
+  return trim_spaces(std::string_view(out.data(), out.size()));
 }
 
-inline Result CsvParser::read_header(const std::string & csv_filename)
+bool getline(std::string_view & cursor, std::string_view & line)
 {
-  if (csv_stream.is_open())
-    csv_stream.close();
+  if (cursor.empty())
+    return false;
 
-  csv_stream.open(gtfs_path + csv_filename);
-  if (!csv_stream.is_open())
+  size_t pos = cursor.find('\n');
+  if (pos == std::string_view::npos)
+  {
+    line = cursor;
+    cursor = std::string_view();
+    return true;
+  }
+
+  line = cursor.substr(0, pos);
+  if (!line.empty() && line.back() == '\r')
+    line.remove_suffix(1);
+  cursor.remove_prefix(pos + 1);
+  return true;
+}
+
+inline Result CsvParser::read_header(const std::string & csv_filename, const std::function<void(size_t)> & reserve_space)
+{
+  // read file into csv_file with C api
+  std::string full_path = gtfs_path + csv_filename;
+  auto file = fopen(full_path.c_str(), "r");
+  if (!file)
     return {ResultCode::ERROR_FILE_ABSENT, "File " + csv_filename + " could not be opened"};
+  fseek(file, 0, SEEK_END);
+  size_t file_size = ftell(file);
+  fseek(file, 0, SEEK_SET);
 
-  std::string header;
-  if (!getline(csv_stream, header) || header.empty())
+  std::string& csv_file = csv_files_per_path[full_path];
+  csv_file.resize(file_size);
+  fread(&csv_file[0], 1, file_size, file);
+  fclose(file);
+
+  csv_cursor = csv_file;
+
+  // Count lines for reserving space char by char
+  if (reserve_space)
+  {
+    size_t line_count = 0;
+    for (char c : csv_file)
+    {
+      if (c == '\n')
+        ++line_count;
+    }
+    reserve_space(line_count);
+  }
+
+  std::string_view header;
+  if (!getline(csv_cursor, header) || header.empty())
     return {ResultCode::ERROR_INVALID_FIELD_FORMAT, "Empty header in file " + csv_filename};
 
   field_sequence = split_record(header, true);
+  field_values_per_row.resize(field_sequence.size());
+
   return ResultCode::OK;
 }
 
-inline Result CsvParser::read_row(std::map<std::string, std::string> & obj)
+inline Result CsvParser::read_row(ParsedCsvRow & obj)
 {
-  obj = {};
-  std::string row;
-  if (!getline(csv_stream, row))
+  obj.clear();
+  
+  std::string_view row;
+  if (!getline(csv_cursor, row))
     return {ResultCode::END_OF_FILE, {}};
 
   if (row == "\r")
     return ResultCode::OK;
 
-  const std::vector<std::string> fields_values = split_record(row);
+  split_record(row, false, field_values_per_row);
 
   // Different count of fields in the row and in the header of csv.
   // Typical approach is to skip not required fields.
-  const size_t fields_count = std::min(field_sequence.size(), fields_values.size());
+  const size_t fields_count = std::min(field_sequence.size(), field_values_per_row.size());
 
   for (size_t i = 0; i < fields_count; ++i)
-    obj[field_sequence[i]] = fields_values[i];
+    obj[field_sequence[i]] = field_values_per_row[i];
 
   return ResultCode::OK;
 }
 
 // Custom types for GTFS fields --------------------------------------------------------------------
 // Id of GTFS entity, a sequence of any UTF-8 characters. Used as type for ID GTFS fields.
-using Id = std::string;
+using Id = InternedString;
 // A string of UTF-8 characters. Used as type for Text GTFS fields.
-using Text = std::string;
+using Text = InternedString;
 
 // Time in GTFS is in the HH:MM:SS format (H:MM:SS is also accepted)
 // Time within a service day can be above 24:00:00, e.g. 28:41:30
@@ -453,7 +749,7 @@ class Time
 {
 public:
   inline Time() = default;
-  inline explicit Time(const std::string & raw_time_str);
+  inline explicit Time(std::string_view raw_time_str);
   inline Time(uint16_t hours, uint16_t minutes, uint16_t seconds);
   inline Time(size_t seconds);
   inline bool is_provided() const;
@@ -463,11 +759,10 @@ public:
   inline bool limit_hours_to_24max();
 
 private:
-  inline void set_total_seconds();
-  inline void set_raw_time();
   bool time_is_provided = false;
-  std::string raw_time;
-  size_t total_seconds = 0;
+  // Width of the hour field as provided in the original string (1,2,3...).
+  // 0 means unknown; default formatting will use width 2 for computed times.
+  uint8_t hour_width = 0;
   uint16_t hh = 0;
   uint16_t mm = 0;
   uint16_t ss = 0;
@@ -484,12 +779,8 @@ inline bool Time::limit_hours_to_24max()
     return false;
 
   hh = hh % 24;
-  set_total_seconds();
-  set_raw_time();
   return true;
 }
-
-inline void Time::set_total_seconds() { total_seconds = hh * 60 * 60 + mm * 60 + ss; }
 
 inline std::string append_leading_zero(const std::string & s, bool check = true)
 {
@@ -501,35 +792,50 @@ inline std::string append_leading_zero(const std::string & s, bool check = true)
   return "0" + s;
 }
 
-inline void Time::set_raw_time()
-{
-  const std::string hh_str = append_leading_zero(std::to_string(hh), false);
-  const std::string mm_str = append_leading_zero(std::to_string(mm));
-  const std::string ss_str = append_leading_zero(std::to_string(ss));
-
-  raw_time = hh_str + ":" + mm_str + ":" + ss_str;
-}
+// No cached raw_time; it is computed on demand in get_raw_time().
 
 // Time in the HH:MM:SS format (H:MM:SS is also accepted). Used as type for Time GTFS fields.
-inline Time::Time(const std::string & raw_time_str) : raw_time(raw_time_str)
+inline Time::Time(std::string_view raw_time_str)
 {
   if (raw_time_str.empty())
-    return;
+        return;
 
-  const size_t len = raw_time.size();
-  if (!(len >= 7 && len <= 9) || raw_time[len - 3] != ':' || raw_time[len - 6] != ':')
-    throw InvalidFieldFormat("Time is not in [[H]H]H:MM:SS format: " + raw_time_str);
+  const char* s = raw_time_str.data();
+  const size_t len = raw_time_str.size();
 
-  hh = static_cast<uint16_t>(std::stoi(raw_time.substr(0, len - 6)));
-  mm = static_cast<uint16_t>(std::stoi(raw_time.substr(len - 5, 2)));
-  ss = static_cast<uint16_t>(std::stoi(raw_time.substr(len - 2)));
+    // Minimum "H:MM:SS" (7 chars), maximum "HHH:MM:SS" (9 chars)
+    if (len < 7 || len > 9)
+      throw InvalidFieldFormat("Invalid time length: " + std::string(raw_time_str));
 
-  if (mm > 60 || ss > 60)
-    throw InvalidFieldFormat("Time minutes/seconds wrong value: " + std::to_string(mm) +
-                             " minutes, " + std::to_string(ss) + " seconds");
+    // Positions of colons for lengths 7–9 are fixed
+    // e.g. len = 8 => "HH:MM:SS" -> colons at 2 and 5
+    size_t c1 = len - 6;
+    size_t c2 = len - 3;
+    if (s[c1] != ':' || s[c2] != ':')
+      throw InvalidFieldFormat("Time not in H[H[H]]:MM:SS format: " + std::string(raw_time_str));
 
-  set_total_seconds();
-  time_is_provided = true;
+    // Parse hours: from s[0] to s[c1-1]
+    uint32_t h = 0;
+    for (size_t i = 0; i < c1; i++) {
+        char ch = s[i];
+        if (unsigned(ch - '0') > 9)
+            throw InvalidFieldFormat("Invalid hour digits in: " + std::string(raw_time_str));
+        h = h * 10 + (ch - '0');
+    }
+
+    // Parse minutes: s[c1+1], s[c1+2]
+    uint32_t m = (s[c1+1] - '0') * 10 + (s[c1+2] - '0');
+    // Parse seconds: s[c2+1], s[c2+2]
+    uint32_t sec = (s[c2+1] - '0') * 10 + (s[c2+2] - '0');
+
+    if (m >= 60 || sec >= 60)
+      throw InvalidFieldFormat("Invalid minute/second values");
+
+    hh = h;
+    mm = m;
+    ss = sec;
+    hour_width = static_cast<uint8_t>(c1);
+    time_is_provided = true;
 }
 
 inline Time::Time(uint16_t hours, uint16_t minutes, uint16_t seconds)
@@ -538,29 +844,34 @@ inline Time::Time(uint16_t hours, uint16_t minutes, uint16_t seconds)
   if (mm > 60 || ss > 60)
     throw InvalidFieldFormat("Time is out of range: " + std::to_string(mm) + "minutes " +
                              std::to_string(ss) + "seconds");
-
-  set_total_seconds();
-  set_raw_time();
+  hour_width = 2;  // default formatting width for computed times
   time_is_provided = true;
 }
 
 inline Time::Time(size_t seconds)
     : time_is_provided(true)
-    , total_seconds(seconds)
     , hh(seconds / 3600)
     , mm((seconds % 3600) / 60)
     , ss(seconds % 3600)
 {
-  set_raw_time();
+  hour_width = 2;
 }
 
 inline bool Time::is_provided() const { return time_is_provided; }
 
-inline size_t Time::get_total_seconds() const { return total_seconds; }
+inline size_t Time::get_total_seconds() const { return static_cast<size_t>(hh) * 3600 + static_cast<size_t>(mm) * 60 + static_cast<size_t>(ss); }
 
 inline std::tuple<uint16_t, uint16_t, uint16_t> Time::get_hh_mm_ss() const { return {hh, mm, ss}; }
 
-inline std::string Time::get_raw_time() const { return raw_time; }
+inline std::string Time::get_raw_time() const {
+  // Determine hour string width
+  std::string h = std::to_string(hh);
+  uint8_t width = hour_width ? hour_width : 2;
+  if (h.size() < width) h.insert(h.begin(), width - h.size(), '0');
+  const std::string m = append_leading_zero(std::to_string(mm));
+  const std::string s = append_leading_zero(std::to_string(ss));
+  return h + ":" + m + ":" + s;
+}
 
 // Service day in the YYYYMMDD format.
 class Date
@@ -568,7 +879,7 @@ class Date
 public:
   inline Date() = default;
   inline Date(uint16_t year, uint16_t month, uint16_t day);
-  inline explicit Date(const std::string & raw_date_str);
+  inline explicit Date(std::string_view raw_date_str);
   inline bool is_provided() const;
   inline std::tuple<uint16_t, uint16_t, uint16_t> get_yyyy_mm_dd() const;
   inline std::string get_raw_date() const;
@@ -576,7 +887,7 @@ public:
 private:
   inline void check_valid() const;
 
-  std::string raw_date;
+  std::string raw_date = "";
   uint16_t yyyy = 0;
   uint16_t mm = 0;
   uint16_t dd = 0;
@@ -616,24 +927,21 @@ inline void Date::check_valid() const
 inline Date::Date(uint16_t year, uint16_t month, uint16_t day) : yyyy(year), mm(month), dd(day)
 {
   check_valid();
-  const std::string mm_str = append_leading_zero(std::to_string(mm));
-  const std::string dd_str = append_leading_zero(std::to_string(dd));
-
-  raw_date = std::to_string(yyyy) + mm_str + dd_str;
+  raw_date = std::to_string(yyyy) + append_leading_zero(std::to_string(mm)) + append_leading_zero(std::to_string(dd));
   date_is_provided = true;
 }
 
-inline Date::Date(const std::string & raw_date_str) : raw_date(raw_date_str)
+inline Date::Date(std::string_view raw_date_str) : raw_date(raw_date_str)
 {
   if (raw_date.empty())
     return;
 
   if (raw_date.size() != 8)
-    throw InvalidFieldFormat("Date is not in YYYY:MM::DD format: " + raw_date_str);
+    throw InvalidFieldFormat("Date is not in YYYY:MM::DD format: " + std::string(raw_date));
 
-  yyyy = static_cast<uint16_t>(std::stoi(raw_date.substr(0, 4)));
-  mm = static_cast<uint16_t>(std::stoi(raw_date.substr(4, 2)));
-  dd = static_cast<uint16_t>(std::stoi(raw_date.substr(6, 2)));
+  yyyy = static_cast<uint16_t>(stoi(raw_date.substr(0, 4)));
+  mm = static_cast<uint16_t>(stoi(raw_date.substr(4, 2)));
+  dd = static_cast<uint16_t>(stoi(raw_date.substr(6, 2)));
 
   check_valid();
 
@@ -1253,14 +1561,15 @@ using Translations = std::vector<Translation>;
 using TranslationsRange = std::pair<Translations::const_iterator, Translations::const_iterator>;
 using Attributions = std::vector<Attribution>;
 
-using ParsedCsvRow = std::map<std::string, std::string>;
-
 class Feed
 {
 public:
   inline Feed() = default;
   inline explicit Feed(const std::string & gtfs_path);
 
+  Id get_id(std::string_view sv) { return interner.intern(sv); }
+  Text get_text(std::string_view sv) { return interner.intern(sv); }
+  
   // 'strict' flag is used to interrupt feed parsing in case of absence or errors in
   // required files. If you want to read incomplete feed, set it to false.
   inline Result read_feed(bool strict=true);
@@ -1370,11 +1679,22 @@ public:
 
 private:
   inline Result parse_csv(const std::string & filename,
-                          const std::function<Result(const ParsedCsvRow & record)> & add_entity);
+                          const std::function<Result(const ParsedCsvRow & record)> & add_entity,
+                          const std::function<void(size_t)> & reserve_space = {});
 
   inline Result write_csv(const std::string & path, const std::string & file,
                           const std::function<void(std::ofstream & out)> & write_header,
                           const std::function<void(std::ofstream & out)> & write_entities) const;
+
+  InternedString get_value_or_default(const ParsedCsvRow & container, const std::string & key,
+                                            const std::string & default_value = "");
+
+  template <class T>
+  inline void set_field(T & field, const ParsedCsvRow & container, const std::string & key,
+                              bool is_optional = true);
+
+  inline bool set_fractional(double & field, const ParsedCsvRow & container, const std::string & key,
+                                   bool is_optional = true);
 
   inline Result add_agency(const ParsedCsvRow & row);
   inline Result add_route(const ParsedCsvRow & row);
@@ -1433,6 +1753,9 @@ private:
 protected:
   std::string gtfs_directory;
 
+  CsvParser parser;
+  StringInterner interner;
+
   Agencies agencies;
   Stops stops;
   Routes routes;
@@ -1453,7 +1776,7 @@ protected:
   FeedInfo feed_info;
 };
 
-inline Feed::Feed(const std::string & gtfs_path) : gtfs_directory(add_trailing_slash(gtfs_path)) {}
+inline Feed::Feed(const std::string & gtfs_path) : gtfs_directory(add_trailing_slash(gtfs_path)), parser(gtfs_directory) {}
 
 inline bool ErrorParsingOptionalFile(const Result & res)
 {
@@ -1563,32 +1886,44 @@ inline Result Feed::write_feed(const std::string & gtfs_path) const
   return {};
 }
 
-inline std::string get_value_or_default(const ParsedCsvRow & container, const std::string & key,
-                                        const std::string & default_value = "")
+inline InternedString Feed::get_value_or_default(const ParsedCsvRow & container, const std::string & key,
+                                        const std::string & default_value)
 {
   const auto it = container.find(key);
   if (it == container.end())
-    return default_value;
+    return interner.intern(default_value);
 
-  return it->second;
+  return interner.intern_dont_copy(*it);
 }
 
 template <class T>
-inline void set_field(T & field, const ParsedCsvRow & container, const std::string & key,
-                      bool is_optional = true)
+inline void Feed::set_field(T & field, const ParsedCsvRow & container, const std::string & key,
+                      bool is_optional)
 {
-  const std::string key_str = get_value_or_default(container, key);
+  static_assert(!std::is_same_v<T, InternedString>, "Use get_value_or_default for InternedString fields");
+
+  std::string_view key_str = {};
+  const auto it = container.find(key);
+  if (it != container.end()) {
+    key_str = *it;
+  }
+
   if (!key_str.empty() || !is_optional)
-    field = static_cast<T>(std::stoi(key_str));
+    field = static_cast<T>(stoi(key_str));
 }
 
-inline bool set_fractional(double & field, const ParsedCsvRow & container, const std::string & key,
-                           bool is_optional = true)
+inline bool Feed::set_fractional(double & field, const ParsedCsvRow & container, const std::string & key,
+                           bool is_optional)
 {
-  const std::string key_str = get_value_or_default(container, key);
+  std::string_view key_str = {};
+  const auto it = container.find(key);
+  if (it != container.end()) {
+    key_str = *it;
+  }
+
   if (!key_str.empty() || !is_optional)
   {
-    field = std::stod(key_str);
+    field = stod(key_str);
     return true;
   }
   return false;
@@ -1614,9 +1949,9 @@ inline Result Feed::add_agency(const ParsedCsvRow & row)
   // Required fields:
   try
   {
-    agency.agency_name = row.at("agency_name");
-    agency.agency_url = row.at("agency_url");
-    agency.agency_timezone = row.at("agency_timezone");
+    agency.agency_name = interner.intern_dont_copy(row.at("agency_name"));
+    agency.agency_url = interner.intern_dont_copy(row.at("agency_url"));
+    agency.agency_timezone = interner.intern_dont_copy(row.at("agency_timezone"));
   }
   catch (const std::out_of_range & ex)
   {
@@ -1640,7 +1975,7 @@ inline Result Feed::add_route(const ParsedCsvRow & row)
   try
   {
     // Required fields:
-    route.route_id = row.at("route_id");
+    route.route_id = interner.intern_dont_copy(row.at("route_id"));
     set_field(route.route_type, row, "route_type", false);
 
     // Optional:
@@ -1683,11 +2018,11 @@ inline Result Feed::add_shape(const ParsedCsvRow & row)
   try
   {
     // Required:
-    point.shape_id = row.at("shape_id");
-    point.shape_pt_sequence = std::stoi(row.at("shape_pt_sequence"));
+    point.shape_id = interner.intern_dont_copy(row.at("shape_id"));
+    point.shape_pt_sequence = stoi(row.at("shape_pt_sequence"));
 
-    point.shape_pt_lon = std::stod(row.at("shape_pt_lon"));
-    point.shape_pt_lat = std::stod(row.at("shape_pt_lat"));
+    point.shape_pt_lon = stod(row.at("shape_pt_lon"));
+    point.shape_pt_lat = stod(row.at("shape_pt_lat"));
     check_coordinates(point.shape_pt_lat, point.shape_pt_lon);
 
     // Optional:
@@ -1714,9 +2049,9 @@ inline Result Feed::add_trip(const ParsedCsvRow & row)
   try
   {
     // Required:
-    trip.route_id = row.at("route_id");
-    trip.service_id = row.at("service_id");
-    trip.trip_id = row.at("trip_id");
+    trip.route_id = interner.intern_dont_copy(row.at("route_id"));
+    trip.service_id = interner.intern_dont_copy(row.at("service_id"));
+    trip.trip_id = interner.intern_dont_copy(row.at("trip_id"));
 
     // Optional:
     set_field(trip.direction_id, row, "direction_id");
@@ -1748,7 +2083,7 @@ inline Result Feed::add_stop(const ParsedCsvRow & row)
 
   try
   {
-    stop.stop_id = row.at("stop_id");
+    stop.stop_id = interner.intern_dont_copy(row.at("stop_id"));
 
     // Optional:
     bool const set_lon = set_fractional(stop.stop_lon, row, "stop_lon");
@@ -1793,9 +2128,9 @@ inline Result Feed::add_stop_time(const ParsedCsvRow & row)
   try
   {
     // Required:
-    stop_time.trip_id = row.at("trip_id");
-    stop_time.stop_id = row.at("stop_id");
-    stop_time.stop_sequence = std::stoi(row.at("stop_sequence"));
+    stop_time.trip_id = interner.intern_dont_copy(row.at("trip_id"));
+    stop_time.stop_id = interner.intern_dont_copy(row.at("stop_id"));
+    stop_time.stop_sequence = stoi(row.at("stop_sequence"));
 
     // Conditionally required:
     stop_time.departure_time = Time(row.at("departure_time"));
@@ -1837,7 +2172,7 @@ inline Result Feed::add_calendar_item(const ParsedCsvRow & row)
   try
   {
     // Required fields:
-    calendar_item.service_id = row.at("service_id");
+    calendar_item.service_id = interner.intern_dont_copy(row.at("service_id"));
 
     set_field(calendar_item.monday, row, "monday", false);
     set_field(calendar_item.tuesday, row, "tuesday", false);
@@ -1873,7 +2208,7 @@ inline Result Feed::add_calendar_date(const ParsedCsvRow & row)
   try
   {
     // Required fields:
-    calendar_date.service_id = row.at("service_id");
+    calendar_date.service_id = interner.intern_dont_copy(row.at("service_id"));
 
     set_field(calendar_date.exception_type, row, "exception_type", false);
     calendar_date.date = Date(row.at("date"));
@@ -1901,8 +2236,8 @@ inline Result Feed::add_transfer(const ParsedCsvRow & row)
   try
   {
     // Required fields:
-    transfer.from_stop_id = row.at("from_stop_id");
-    transfer.to_stop_id = row.at("to_stop_id");
+    transfer.from_stop_id = interner.intern_dont_copy(row.at("from_stop_id"));
+    transfer.to_stop_id = interner.intern_dont_copy(row.at("to_stop_id"));
     set_field(transfer.transfer_type, row, "transfer_type", false);
 
     // Optional:
@@ -1931,7 +2266,7 @@ inline Result Feed::add_frequency(const ParsedCsvRow & row)
   try
   {
     // Required fields:
-    frequency.trip_id = row.at("trip_id");
+    frequency.trip_id = interner.intern_dont_copy(row.at("trip_id"));
     frequency.start_time = Time(row.at("start_time"));
     frequency.end_time = Time(row.at("end_time"));
     set_field(frequency.headway_secs, row, "headway_secs", false);
@@ -1962,7 +2297,7 @@ inline Result Feed::add_fare_attributes(const ParsedCsvRow & row)
   try
   {
     // Required fields:
-    item.fare_id = row.at("fare_id");
+    item.fare_id = interner.intern_dont_copy(row.at("fare_id"));
     set_fractional(item.price, row, "price", false);
 
     item.currency_type = row.at("currency_type");
@@ -1996,7 +2331,7 @@ inline Result Feed::add_fare_rule(const ParsedCsvRow & row)
   try
   {
     // Required fields:
-    fare_rule.fare_id = row.at("fare_id");
+    fare_rule.fare_id = interner.intern_dont_copy(row.at("fare_id"));
   }
   catch (const std::out_of_range & ex)
   {
@@ -2028,9 +2363,9 @@ inline Result Feed::add_pathway(const ParsedCsvRow & row)
   try
   {
     // Required fields:
-    path.pathway_id = row.at("pathway_id");
-    path.from_stop_id = row.at("from_stop_id");
-    path.to_stop_id = row.at("to_stop_id");
+    path.pathway_id = interner.intern_dont_copy(row.at("pathway_id"));
+    path.from_stop_id = interner.intern_dont_copy(row.at("from_stop_id"));
+    path.to_stop_id = interner.intern_dont_copy(row.at("to_stop_id"));
     set_field(path.pathway_mode, row, "pathway_mode", false);
     set_field(path.is_bidirectional, row, "is_bidirectional", false);
 
@@ -2067,7 +2402,7 @@ inline Result Feed::add_level(const ParsedCsvRow & row)
   try
   {
     // Required fields:
-    level.level_id = row.at("level_id");
+    level.level_id = interner.intern_dont_copy(row.at("level_id"));
 
     set_fractional(level.level_index, row, "level_index", false);
   }
@@ -2097,9 +2432,9 @@ inline Result Feed::add_feed_info(const ParsedCsvRow & row)
   try
   {
     // Required fields:
-    feed_info.feed_publisher_name = row.at("feed_publisher_name");
-    feed_info.feed_publisher_url = row.at("feed_publisher_url");
-    feed_info.feed_lang = row.at("feed_lang");
+    feed_info.feed_publisher_name = interner.intern_dont_copy(row.at("feed_publisher_name"));
+    feed_info.feed_publisher_url = interner.intern_dont_copy(row.at("feed_publisher_url"));
+    feed_info.feed_lang = interner.intern_dont_copy(row.at("feed_lang"));
 
     // Optional fields:
     feed_info.feed_start_date = Date(get_value_or_default(row, "feed_start_date"));
@@ -2128,23 +2463,23 @@ inline Result Feed::add_feed_info(const ParsedCsvRow & row)
 
 inline Result Feed::add_translation(const ParsedCsvRow & row)
 {
-  static const std::vector<Text> available_tables{"agency",     "stops",    "routes", "trips",
-                                                  "stop_times", "pathways", "levels"};
+  const std::vector<Text> available_tables{interner.intern("agency"),     interner.intern("stops"),    interner.intern("routes"), interner.intern("trips"),
+                                                  interner.intern("stop_times"), interner.intern("pathways"), interner.intern("levels")};
   Translation translation;
 
   try
   {
     // Required fields:
-    translation.table_name = row.at("table_name");
+    translation.table_name = interner.intern_dont_copy(row.at("table_name"));
     if (std::find(available_tables.begin(), available_tables.end(), translation.table_name) ==
         available_tables.end())
     {
       throw InvalidFieldFormat("Field table_name of translations doesn't have required value");
     }
 
-    translation.field_name = row.at("field_name");
-    translation.language = row.at("language");
-    translation.translation = row.at("translation");
+    translation.field_name = interner.intern_dont_copy(row.at("field_name"));
+    translation.language = interner.intern_dont_copy(row.at("language"));
+    translation.translation = interner.intern_dont_copy(row.at("translation"));
 
     // Conditionally required:
     translation.record_id = get_value_or_default(row, "record_id");
@@ -2178,7 +2513,7 @@ inline Result Feed::add_attribution(const ParsedCsvRow & row)
   try
   {
     // Required fields:
-    attribution.organization_name = row.at("organization_name");
+    attribution.organization_name = interner.intern_dont_copy(row.at("organization_name"));
 
     // Optional fields:
     attribution.attribution_id = get_value_or_default(row, "attribution_id");
@@ -2227,14 +2562,14 @@ inline Result Feed::write_csv(const std::string & path, const std::string & file
 }
 
 inline Result Feed::parse_csv(const std::string & filename,
-                              const std::function<Result(const ParsedCsvRow & record)> & add_entity)
+                              const std::function<Result(const ParsedCsvRow & record)> & add_entity,
+                              const std::function<void(size_t)> & reserve_space)
 {
-  CsvParser parser(gtfs_directory);
-  auto res_header = parser.read_header(filename);
+  auto res_header = parser.read_header(filename, reserve_space);
   if (res_header.code != ResultCode::OK)
     return res_header;
 
-  ParsedCsvRow record;
+  ParsedCsvRow record(parser.field_sequence);
   Result res_row;
   while ((res_row = parser.read_row(record)) != ResultCode::END_OF_FILE)
   {
@@ -2386,7 +2721,8 @@ inline void Feed::add_trip(const Trip & trip) { trips.emplace_back(trip); }
 inline Result Feed::read_stop_times()
 {
   auto handler = [this](const ParsedCsvRow & record) { return this->add_stop_time(record); };
-  return parse_csv(file_stop_times, handler);
+  auto reserve_space = [this](size_t line_count) { this->stop_times.reserve(line_count + 2); };
+  return parse_csv(file_stop_times, handler, reserve_space);
 }
 
 inline Result Feed::write_stop_times(const std::string & gtfs_path) const
@@ -2603,8 +2939,8 @@ inline const Transfer & Feed::get_transfer(const Id & from_stop_id,
                                                   const Id & to_stop_id) const
 {
   const auto it =
-                         std::lower_bound(transfers.begin(), transfers.end(), "",
-                                          [&](const auto & a, const Id & )
+                         std::lower_bound(transfers.begin(), transfers.end(), Id{},
+                                          [&](const Transfer & a, const Id & )
                                           { return a.from_stop_id < from_stop_id || (a.from_stop_id == from_stop_id && a.to_stop_id < to_stop_id); });
 
   if (it == transfers.end() || it->from_stop_id != it->from_stop_id || it->to_stop_id != to_stop_id)
@@ -2753,9 +3089,9 @@ inline void Feed::write_agencies(std::ofstream & out) const
   for (const auto & agency : agencies)
   {
     std::vector<std::string> fields{wrap(agency.agency_id),  wrap(agency.agency_name),
-                                    wrap(agency.agency_url), agency.agency_timezone,
-                                    agency.agency_lang,      wrap(agency.agency_phone),
-                                    agency.agency_fare_url,  agency.agency_email};
+                                    wrap(agency.agency_url), wrap(agency.agency_timezone),
+                                    wrap(agency.agency_lang),      wrap(agency.agency_phone),
+                                    wrap(agency.agency_fare_url),  wrap(agency.agency_email)};
     write_joined(out, std::move(fields));
   }
 }
@@ -2770,9 +3106,9 @@ inline void Feed::write_routes(std::ofstream & out) const
                                     wrap(route.route_long_name),
                                     wrap(route.route_desc),
                                     wrap(route.route_type),
-                                    route.route_url,
-                                    route.route_color,
-                                    route.route_text_color,
+                                    wrap(route.route_url),
+                                    wrap(route.route_color),
+                                    wrap(route.route_text_color),
                                     wrap(route.route_sort_order),
                                     "" /* continuous_pickup */,
                                     "" /* continuous_drop_off */};
@@ -2810,10 +3146,10 @@ inline void Feed::write_stops(std::ofstream & out) const
   for (const auto & stop : stops)
   {
     std::vector<std::string> fields{
-        wrap(stop.stop_id),        wrap(stop.stop_code),    wrap(stop.stop_name),
-        wrap(stop.stop_desc),      wrap(stop.stop_lat),     wrap(stop.stop_lon),
-        wrap(stop.zone_id),        stop.stop_url,           wrap(stop.location_type),
-        wrap(stop.parent_station), stop.stop_timezone,      wrap(stop.wheelchair_boarding),
+        wrap(stop.stop_id),        wrap(stop.stop_code),     wrap(stop.stop_name),
+        wrap(stop.stop_desc),      wrap(stop.stop_lat),      wrap(stop.stop_lon),
+        wrap(stop.zone_id),        wrap(stop.stop_url),      wrap(stop.location_type),
+        wrap(stop.parent_station), wrap(stop.stop_timezone), wrap(stop.wheelchair_boarding),
         wrap(stop.level_id),       wrap(stop.platform_code)};
     write_joined(out, std::move(fields));
   }
@@ -2847,8 +3183,8 @@ inline void Feed::write_calendar(std::ofstream & out) const
     std::vector<std::string> fields{
         wrap(item.service_id),       wrap(item.monday),   wrap(item.tuesday),
         wrap(item.wednesday),        wrap(item.thursday), wrap(item.friday),
-        wrap(item.saturday),         wrap(item.sunday),   item.start_date.get_raw_date(),
-        item.end_date.get_raw_date()};
+        wrap(item.saturday),         wrap(item.sunday),   wrap(item.start_date.get_raw_date()),
+        wrap(item.end_date.get_raw_date())};
     write_joined(out, std::move(fields));
   }
 }
@@ -2857,7 +3193,7 @@ inline void Feed::write_calendar_dates(std::ofstream & out) const
 {
   for (const auto & date : calendar_dates)
   {
-    std::vector<std::string> fields{wrap(date.service_id), date.date.get_raw_date(),
+    std::vector<std::string> fields{wrap(date.service_id), wrap(date.date.get_raw_date()),
                                     wrap(date.exception_type)};
     write_joined(out, std::move(fields));
   }
@@ -2935,14 +3271,14 @@ inline void Feed::write_levels(std::ofstream & out) const
 inline void Feed::write_feed_info(std::ofstream & out) const
 {
   std::vector<std::string> fields{wrap(feed_info.feed_publisher_name),
-                                  feed_info.feed_publisher_url,
-                                  feed_info.feed_lang,
+                                  wrap(feed_info.feed_publisher_url),
+                                  wrap(feed_info.feed_lang),
                                   "" /* default_lang */,
-                                  feed_info.feed_start_date.get_raw_date(),
-                                  feed_info.feed_end_date.get_raw_date(),
+                                  wrap(feed_info.feed_start_date.get_raw_date()),
+                                  wrap(feed_info.feed_end_date.get_raw_date()),
                                   wrap(feed_info.feed_version),
-                                  feed_info.feed_contact_email,
-                                  feed_info.feed_contact_url};
+                                  wrap(feed_info.feed_contact_email),
+                                  wrap(feed_info.feed_contact_url)};
   // TODO: handle new field_info field.
   write_joined(out, std::move(fields));
 }
@@ -2951,8 +3287,8 @@ inline void Feed::write_translations(std::ofstream & out) const
 {
   for (const auto & translation : translations)
   {
-    std::vector<std::string> fields{translation.table_name,       translation.field_name,
-                                    translation.language,         wrap(translation.translation),
+    std::vector<std::string> fields{wrap(translation.table_name),       wrap(translation.field_name),
+                                    wrap(translation.language),         wrap(translation.translation),
                                     wrap(translation.record_id),  wrap(translation.record_sub_id),
                                     wrap(translation.field_value)};
     write_joined(out, std::move(fields));
@@ -2966,8 +3302,8 @@ inline void Feed::write_attributions(std::ofstream & out) const
     std::vector<std::string> fields{
         wrap(attr.attribution_id), wrap(attr.agency_id),         wrap(attr.route_id),
         wrap(attr.trip_id),        wrap(attr.organization_name), wrap(attr.is_producer),
-        wrap(attr.is_operator),    wrap(attr.is_authority),      attr.attribution_url,
-        attr.attribution_email,    attr.attribution_phone};
+        wrap(attr.is_operator),    wrap(attr.is_authority),      wrap(attr.attribution_url),
+        wrap(attr.attribution_email),    wrap(attr.attribution_phone)};
     write_joined(out, std::move(fields));
   }
 }
